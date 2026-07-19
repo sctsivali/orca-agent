@@ -21,6 +21,9 @@ runs:
         REF: ${{ inputs.ref }}
       run: |
         set -euo pipefail
+        # strip any whitespace/newline that may have been pasted into the secret
+        GITLAB_TOKEN="$(printf '%s' "$GITLAB_TOKEN" | tr -d '[:space:]')"
+        if [ -z "$GITLAB_TOKEN" ]; then echo "GITLAB_TOKEN secret is empty" >&2; exit 1; fi
         rm -rf src && mkdir src && cd src
         git init -q
         git remote add origin "https://oauth2:${GITLAB_TOKEN}@dev.sivali.co/research-and-dev/orcahub.git"
