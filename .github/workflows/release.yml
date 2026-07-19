@@ -170,12 +170,11 @@ jobs:
           files: release/*
           fail_on_unmatched_files: true
           body: |
-            Portable, signed ORCA Agent build (source: GitLab `${{ inputs.ref }}`).
+            Portable, signed ORCA Agent build for Linux.
 
-            Assets: self-contained `orca-agent-linux-{x86_64,aarch64}.tar.gz`
-            (glibc >= 2.28, bundles Python), pure-Python `orca-agent.pyz`
-            (host python3 >= 3.8), the wheel, `SHA256SUMS`, `SHA256SUMS.sig`,
-            and `signing-key.asc`.
+            Self-contained `orca-agent-linux-{x86_64,aarch64}.tar.gz` (glibc >= 2.28,
+            bundle their own Python), a pure-Python `orca-agent.pyz` (host python3 >= 3.8),
+            the wheel, and `SHA256SUMS` with a detached GPG signature and public key.
 
             Verify:
             ```
