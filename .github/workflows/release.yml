@@ -1,0 +1,186 @@
+name: release
+
+# Build portable, signed ORCA Agent artifacts and publish them as a GitHub Release
+# on this (public) repository. The agent source is private: it lives in the GitLab
+# monorepo and is fetched into the ephemeral runner at build time, never stored here.
+#
+# Cut a release: bump orca_agent.__version__ in the GitLab source, then run this
+# workflow (Actions -> release -> Run workflow) with `ref` set to the GitLab
+# branch/tag/SHA to build. The release is tagged v<version> from the source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: GitLab source ref to build (branch, tag, or SHA)
+        required: true
+        default: dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.8 is the floor and the hardest target (PEP 604/585). Kept on
+          # ubuntu-22.04 because the 24.04 image dropped it.
+          - { python: '3.8', runner: ubuntu-22.04 }
+          - { python: '3.9', runner: ubuntu-22.04 }
+          - { python: '3.10', runner: ubuntu-24.04 }
+          - { python: '3.11', runner: ubuntu-24.04 }
+          - { python: '3.12', runner: ubuntu-24.04 }
+          - { python: '3.13', runner: ubuntu-24.04 }
+          - { python: '3.12', runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-source
+        with:
+          token: ${{ secrets.GITLAB_TOKEN }}
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Import gate + unit tests
+        working-directory: src/orca-agent
+        run: |
+          python -c "import orca_agent.main, sys; print('import OK on', sys.version.split()[0])"
+          python -m unittest discover -s tests -v
+
+  build-binary:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, image: quay.io/pypa/manylinux_2_28_x86_64 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, image: quay.io/pypa/manylinux_2_28_aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-source
+        with:
+          token: ${{ secrets.GITLAB_TOKEN }}
+          ref: ${{ inputs.ref }}
+      - name: Build self-contained binary in manylinux (glibc 2.28 floor)
+        working-directory: src/orca-agent
+        run: |
+          SDE=$(git log -1 --format=%ct)
+          docker run --rm -e SOURCE_DATE_EPOCH="$SDE" -v "$PWD:/io" -w /io \
+            ${{ matrix.image }} bash packaging/build-binary.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: src/orca-agent/orca-agent-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  build-pure:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-source
+        with:
+          token: ${{ secrets.GITLAB_TOKEN }}
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build wheel + zipapp (pure Python, host python3 >= 3.8)
+        working-directory: src/orca-agent
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel
+          rm -rf stage && mkdir stage && cp -r orca_agent stage/
+          find stage -name __pycache__ -type d -prune -exec rm -rf {} + || true
+          python -m zipapp stage -p "/usr/bin/env python3" -m "orca_agent.main:main" -o orca-agent.pyz
+          python orca-agent.pyz --version
+          mkdir -p out && cp dist/orca_agent-*.whl orca-agent.pyz out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pure
+          path: src/orca-agent/out
+          if-no-files-found: error
+
+  release:
+    needs: [build-binary, build-pure]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write        # create the release + tag on this repo
+      id-token: write        # provenance signing (Sigstore)
+      attestations: write    # publish the attestation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-source
+        with:
+          token: ${{ secrets.GITLAB_TOKEN }}
+          ref: ${{ inputs.ref }}
+      - name: Resolve version from source
+        id: ver
+        run: |
+          V=$(python3 -c "import re,pathlib;print(re.search(r'__version__\s*=\s*[\'\"]([^\'\"]+)', pathlib.Path('src/orca-agent/orca_agent/__init__.py').read_text()).group(1))")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble assets + SHA256SUMS
+        run: |
+          mkdir -p release
+          cp artifacts/binary-x86_64/*.tar.gz artifacts/binary-aarch64/*.tar.gz release/
+          cp artifacts/pure/*.whl artifacts/pure/orca-agent.pyz release/
+          cd release
+          sha256sum orca-agent-linux-x86_64.tar.gz orca-agent-linux-aarch64.tar.gz \
+            orca-agent.pyz orca_agent-*.whl > SHA256SUMS
+          cat SHA256SUMS
+      - name: Import GPG signing key
+        id: gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Sign SHA256SUMS + export public key
+        run: |
+          cd release
+          gpg --batch --yes --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" \
+            --detach-sign --armor -o SHA256SUMS.sig SHA256SUMS
+          gpg --armor --export "${{ steps.gpg.outputs.fingerprint }}" > signing-key.asc
+          gpg --verify SHA256SUMS.sig SHA256SUMS
+          echo "signing fingerprint: ${{ steps.gpg.outputs.fingerprint }}"
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/orca-agent-linux-x86_64.tar.gz
+            release/orca-agent-linux-aarch64.tar.gz
+            release/orca-agent.pyz
+            release/orca_agent-*.whl
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          files: release/*
+          fail_on_unmatched_files: true
+          body: |
+            Portable, signed ORCA Agent build (source: GitLab `${{ inputs.ref }}`).
+
+            Assets: self-contained `orca-agent-linux-{x86_64,aarch64}.tar.gz`
+            (glibc >= 2.28, bundles Python), pure-Python `orca-agent.pyz`
+            (host python3 >= 3.8), the wheel, `SHA256SUMS`, `SHA256SUMS.sig`,
+            and `signing-key.asc`.
+
+            Verify:
+            ```
+            gpg --import signing-key.asc
+            gpg --verify SHA256SUMS.sig SHA256SUMS
+            sha256sum -c SHA256SUMS
+            ```
+            Signing key fingerprint: ${{ steps.gpg.outputs.fingerprint }}

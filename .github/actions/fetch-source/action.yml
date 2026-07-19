@@ -1,0 +1,33 @@
+name: Fetch private agent source
+description: >
+  Sparse, shallow-clone the orca-agent source from the private GitLab monorepo
+  into ./src. The source is fetched into the ephemeral runner only and is never
+  stored in this public repository.
+
+inputs:
+  token:
+    description: GitLab read-only token (read_repository scope)
+    required: true
+  ref:
+    description: GitLab ref to build (branch, tag, or commit SHA)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GITLAB_TOKEN: ${{ inputs.token }}
+        REF: ${{ inputs.ref }}
+      run: |
+        set -euo pipefail
+        rm -rf src && mkdir src && cd src
+        git init -q
+        git remote add origin "https://oauth2:${GITLAB_TOKEN}@dev.sivali.co/research-and-dev/orcahub.git"
+        git config core.sparseCheckout true
+        git sparse-checkout init --cone
+        git sparse-checkout set orca-agent
+        git fetch -q --depth 1 origin "${REF}"
+        git checkout -q FETCH_HEAD
+        echo "fetched orca-agent source at ${REF}"
+        ls orca-agent
