@@ -1,20 +1,23 @@
 name: release
 
-# Build portable, signed ORCA Agent artifacts and publish them as a GitHub Release
-# on this (public) repository. The agent source is private: it lives in the GitLab
+# Build portable, signed ORCA Agent candidates. Publishing a GitHub Release is an
+# explicit opt-in after QA. The agent source is private: it lives in the GitLab
 # monorepo and is fetched into the ephemeral runner at build time, never stored here.
 #
 # Cut a release: bump orca_agent.__version__ in the GitLab source, then run this
 # workflow (Actions -> release -> Run workflow) with `ref` set to the GitLab
-# branch/tag/SHA to build. The release is tagged v<version> from the source.
+# full commit SHA to build. Mutable branch and tag names are rejected.
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: GitLab source ref to build (branch, tag, or SHA)
+        description: Exact 40-character GitLab source commit SHA
         required: true
-        default: dev
+      publish:
+        description: Publish the immutable release after its QA approval
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,19 +43,26 @@ jobs:
           - { python: '3.12', runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/fetch-source
         with:
           token: ${{ secrets.GITLAB_TOKEN }}
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Import gate + unit tests
-        working-directory: src/orca-agent
+      - name: Install integration prerequisites
         run: |
-          python -c "import orca_agent.main, sys; print('import OK on', sys.version.split()[0])"
-          python -m unittest discover -s tests -v
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gnupg openssl
+      - name: Verify pinned native FRP fixtures
+        run: python scripts/fetch-frp-fixtures.py --output "$RUNNER_TEMP/frp-fixtures"
+      - name: Import gate and complete behavior tests
+        env:
+          ORCA_TEST_FRP_DIR: ${{ runner.temp }}/frp-fixtures
+        run: |
+          PYTHONPATH=src/orca-agent python -c "import orca_agent.main, sys; print('import OK on', sys.version.split()[0])"
+          python scripts/verify-tests.py
 
   build-binary:
     needs: test
@@ -60,11 +70,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x86_64, runner: ubuntu-24.04, image: quay.io/pypa/manylinux_2_28_x86_64 }
-          - { arch: aarch64, runner: ubuntu-24.04-arm, image: quay.io/pypa/manylinux_2_28_aarch64 }
+          - { arch: x86_64, runner: ubuntu-24.04, image: 'quay.io/pypa/manylinux_2_28_x86_64@sha256:407f771c51a2c3e83ebe5a7970b4289ead3a6db21d9b9c089168775cad11d328' }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, image: 'quay.io/pypa/manylinux_2_28_aarch64@sha256:c22ffd129ac99a8a42d1f2c2f4e88a9089288dd9ee987a7092da1c7dc48f27a9' }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/fetch-source
         with:
           token: ${{ secrets.GITLAB_TOKEN }}
@@ -75,7 +85,18 @@ jobs:
           SDE=$(git log -1 --format=%ct)
           docker run --rm -e SOURCE_DATE_EPOCH="$SDE" -v "$PWD:/io" -w /io \
             ${{ matrix.image }} bash packaging/build-binary.sh ${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - name: Verify pinned native FRP fixtures for the binary gate
+        run: python3 scripts/fetch-frp-fixtures.py --output "$RUNNER_TEMP/frp-fixtures"
+      - name: Verify actual signed native installer, readiness, and rollback
+        run: |
+          docker run --rm --network none --cgroupns host \
+            -e PATH=/opt/python/cp312-cp312/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -e ORCA_NATIVE_FIXTURE_ISOLATED=1 \
+            -e ORCA_TEST_AGENT_BINARY=/src/orca-agent/orca-agent-linux-${{ matrix.arch }}.tar.gz \
+            -e ORCA_TEST_FRP_DIR=/frp \
+            -v "$PWD/src:/src:ro" -v "$RUNNER_TEMP/frp-fixtures:/frp:ro" -w /src \
+            ${{ matrix.image }} python3 orca-agent/packaging/native_fixture.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-${{ matrix.arch }}
           path: src/orca-agent/orca-agent-linux-${{ matrix.arch }}.tar.gz
@@ -85,25 +106,25 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/fetch-source
         with:
           token: ${{ secrets.GITLAB_TOKEN }}
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Build wheel + zipapp (pure Python, host python3 >= 3.8)
         working-directory: src/orca-agent
         run: |
-          python -m pip install --upgrade build
+          python -m pip install "build==1.2.2.post1"
           python -m build --wheel
           rm -rf stage && mkdir stage && cp -r orca_agent stage/
           find stage -name __pycache__ -type d -prune -exec rm -rf {} + || true
           python -m zipapp stage -p "/usr/bin/env python3" -m "orca_agent.main:main" -o orca-agent.pyz
           python orca-agent.pyz --version
           mkdir -p out && cp dist/orca_agent-*.whl orca-agent.pyz out/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pure
           path: src/orca-agent/out
@@ -117,53 +138,109 @@ jobs:
       id-token: write        # provenance signing (Sigstore)
       attestations: write    # publish the attestation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/fetch-source
         with:
           token: ${{ secrets.GITLAB_TOKEN }}
           ref: ${{ inputs.ref }}
       - name: Resolve version from source
         id: ver
+        env:
+          SOURCE_REF: ${{ inputs.ref }}
         run: |
           V=$(python3 -c "import re,pathlib;print(re.search(r'__version__\s*=\s*[\'\"]([^\'\"]+)', pathlib.Path('src/orca-agent/orca_agent/__init__.py').read_text()).group(1))")
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid source version" >&2; exit 1; }
+          SOURCE_SHA="$(git -C src rev-parse HEAD)"
+          [[ "$SOURCE_SHA" == "${SOURCE_REF,,}" ]] || { echo "Source changed during release" >&2; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v$V" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
+          echo "source-sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
-      - name: Assemble assets + SHA256SUMS
+      - name: Reject an existing immutable release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName > "$RUNNER_TEMP/existing-releases.json"
+          python - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          releases = json.loads((Path(os.environ['RUNNER_TEMP']) / 'existing-releases.json').read_text())
+          if any(release['tagName'] == os.environ['RELEASE_TAG'] for release in releases):
+              raise SystemExit('Release already exists; immutable assets must not be replaced')
+          PYCODE
+          [[ -z "$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")" ]] || { echo "Release tag already exists" >&2; exit 1; }
+      - name: Mirror checksum-verified official FRP archives
+        run: python3 scripts/fetch-frp-fixtures.py --all-architectures --output "$RUNNER_TEMP/frp-release"
+      - name: Assemble assets and signed release manifest
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          SOURCE_SHA: ${{ steps.ver.outputs.source-sha }}
         run: |
           mkdir -p release
           cp artifacts/binary-x86_64/*.tar.gz artifacts/binary-aarch64/*.tar.gz release/
           cp artifacts/pure/*.whl artifacts/pure/orca-agent.pyz release/
+          cp "$RUNNER_TEMP/frp-release"/frp_0.68.1_linux_{amd64,arm64}.tar.gz release/
+          cp "$RUNNER_TEMP/frp-release/frp_sha256_checksums.txt" release/frp_sha256_checksums.txt
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          manifest = {'version': os.environ['RELEASE_VERSION'],
+                      'sourceRevision': os.environ['SOURCE_SHA'], 'frpVersion': '0.68.1'}
+          Path('release/release-manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
+          PYCODE
           cd release
           sha256sum orca-agent-linux-x86_64.tar.gz orca-agent-linux-aarch64.tar.gz \
-            orca-agent.pyz orca_agent-*.whl > SHA256SUMS
-          cat SHA256SUMS
+            orca-agent.pyz orca_agent-*.whl release-manifest.json \
+            frp_0.68.1_linux_amd64.tar.gz frp_0.68.1_linux_arm64.tar.gz \
+            frp_sha256_checksums.txt > SHA256SUMS
+          sha256sum -c SHA256SUMS
       - name: Import GPG signing key
         id: gpg
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec # v6
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
-      - name: Sign SHA256SUMS + export public key
+      - name: Sign checksums and verify the actual signing identity
+        env:
+          SIGNING_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          SIGNING_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+          APPROVED_SIGNING_FINGERPRINT: 318F8AFC31888F13AE9F68BC2F6F8C318AD69032
         run: |
           cd release
-          gpg --batch --yes --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" \
-            --detach-sign --armor -o SHA256SUMS.sig SHA256SUMS
-          gpg --armor --export "${{ steps.gpg.outputs.fingerprint }}" > signing-key.asc
-          gpg --verify SHA256SUMS.sig SHA256SUMS
-          echo "signing fingerprint: ${{ steps.gpg.outputs.fingerprint }}"
+          printf '%s' "$SIGNING_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --local-user "$SIGNING_FINGERPRINT" --detach-sign --armor -o SHA256SUMS.sig SHA256SUMS
+          gpg --armor --export "$SIGNING_FINGERPRINT" > signing-key.asc
+          gpg --batch --status-fd 1 --verify SHA256SUMS.sig SHA256SUMS > signature-status.txt
+          ACTUAL_FPR="$(awk '$1=="[GNUPG:]" && $2=="VALIDSIG" {count++; signer=(NF>=12?$12:$3)} END {if(count==1)print signer}' signature-status.txt)"
+          [[ "$ACTUAL_FPR" == "$SIGNING_FINGERPRINT" ]] || { echo "Actual release signer differs from the approved signing key" >&2; exit 1; }
+          [[ "$ACTUAL_FPR" == "$APPROVED_SIGNING_FINGERPRINT" ]] || { echo "Release signer is not independently approved" >&2; exit 1; }
+          rm signature-status.txt
+          sha256sum -c SHA256SUMS
+          echo "Verified signing fingerprint: $SIGNING_FINGERPRINT"
       - name: Attest build provenance (SLSA)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             release/orca-agent-linux-x86_64.tar.gz
             release/orca-agent-linux-aarch64.tar.gz
             release/orca-agent.pyz
             release/orca_agent-*.whl
+            release/release-manifest.json
+            release/frp_0.68.1_linux_amd64.tar.gz
+            release/frp_0.68.1_linux_arm64.tar.gz
+      - name: Retain the exact signed candidate for live QA and promotion
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-candidate-${{ steps.ver.outputs.tag }}-${{ inputs.ref }}-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        if: ${{ inputs.publish }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
@@ -174,12 +251,19 @@ jobs:
 
             Self-contained `orca-agent-linux-{x86_64,aarch64}.tar.gz` (glibc >= 2.28,
             bundle their own Python), a pure-Python `orca-agent.pyz` (host python3 >= 3.8),
-            the wheel, and `SHA256SUMS` with a detached GPG signature and public key.
+            the wheel, exact-source `release-manifest.json`, and the unchanged official
+            FRP 0.68.1 amd64/arm64 archives (including their upstream licenses).
+            Every distribution asset is covered by `SHA256SUMS` and its detached GPG signature.
+
+            Source revision: `${{ steps.ver.outputs.source-sha }}`
+            FRP version: `0.68.1`
+            Python 3.8–3.13 and ARM64 real behavior tests ran with no skipped scenarios.
 
             Verify:
             ```
             gpg --import signing-key.asc
-            gpg --verify SHA256SUMS.sig SHA256SUMS
+            gpg --status-fd 1 --verify SHA256SUMS.sig SHA256SUMS
             sha256sum -c SHA256SUMS
             ```
             Signing key fingerprint: ${{ steps.gpg.outputs.fingerprint }}
+            Compare this actual signing fingerprint with an independently approved fingerprint.
